@@ -123,7 +123,7 @@ result = response.json()
 print(f"Prediction: {result['prediction']}")
 ```
 
-## 🎯 Streamlit Features
+## Streamlit Features
 
 1. **Single Prediction**
    - Manual input for all 79 features
