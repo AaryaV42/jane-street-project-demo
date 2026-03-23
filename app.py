@@ -1,279 +1,225 @@
 import streamlit as st
-import pandas as pd
 import numpy as np
-import polars as pl
+import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import seaborn as sns
-import os
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import math
+import warnings
 
-st.set_page_config(page_title="Jane Street EDA", layout="wide")
-st.title("Jane Street Real-Time Market Data — EDA")
+warnings.filterwarnings("ignore")
 
-ROOT_DIR = st.sidebar.text_input(
-    "Dataset root path",
-    value="/kaggle/input/jane-street-real-time-market-data-forecasting",
+st.set_page_config(page_title="Stock Market Prediction", layout="wide")
+st.title("Stock Market Prediction — LSTM")
+
+st.sidebar.header("Upload Data")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload 1 to 4 company CSV files (with columns: Date, Open, High, Low, Close, Adj Close, Volume)",
+    type="csv",
+    accept_multiple_files=True,
 )
 
-PARTITION_OPTIONS = list(range(10))
+BETA = 0.93
+LOOKBACK = 60
+EPOCHS = 50
+BATCH_SIZE = 32
 
 
-def load_parquet(root, partition_id):
-    path = f"{root}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    return pl.read_parquet(path)
+def load_and_clean(file):
+    df = pd.read_csv(file)
+    df.dropna(inplace=True)
+    df["Date"] = pd.to_datetime(df["Date"])
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+    df = df.sort_values("Date", ignore_index=True)
+    return df
 
 
-section = st.sidebar.radio(
-    "Section",
-    [
-        "Features Metadata",
-        "Responders Metadata",
-        "Sample Submission",
-        "Missing Values",
-        "Feature Correlations",
-        "Responder Distributions",
-        "Responder Correlations",
-        "Symbol ID Distribution",
-        "Date ID Distribution",
-    ],
-)
+def apply_ema_smoothing(df, beta=BETA):
+    prices = np.array(df["Close"])
+    smoothed = [prices[0]]
+    for i in range(1, len(prices)):
+        smoothed.append(smoothed[-1] * beta + (1 - beta) * prices[i])
+    df = df.copy()
+    df["Close"] = smoothed
+    return df
 
 
-if section == "Features Metadata":
-    st.header("Features Metadata")
-    fpath = f"{ROOT_DIR}/features.csv"
-    if not os.path.exists(fpath):
-        st.error(f"File not found: {fpath}")
-        st.stop()
+def add_moving_averages(df):
+    for window in [10, 20, 50]:
+        df[f"MA_{window}"] = df["Close"].rolling(window).mean()
+    return df
 
-    features = pd.read_csv(fpath)
-    st.dataframe(features, use_container_width=True)
 
-    st.subheader("Feature Tag Bitmap")
-    fig, ax = plt.subplots(figsize=(20, 6))
-    ax.imshow(features.iloc[:, 1:].T.values, cmap="gray", aspect="auto")
-    ax.set_xlabel("feature_00 ~ feature_78")
-    ax.set_ylabel("tag_0 ~ tag_16")
-    ax.set_yticks(np.arange(17))
-    ax.set_xticks(np.arange(79))
-    ax.grid(True)
+def build_sequences(scaled, lookback=LOOKBACK):
+    X, y = [], []
+    for i in range(lookback, len(scaled)):
+        X.append(scaled[i - lookback:i, 0])
+        y.append(scaled[i, 0])
+    return np.array(X), np.array(y)
+
+
+def train_lstm(x_train, y_train, epochs=EPOCHS, batch_size=BATCH_SIZE):
+    from keras.models import Sequential
+    from keras.layers import Dense, LSTM, Dropout
+
+    x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(x_train.shape[1], 1)),
+        Dropout(0.2),
+        LSTM(50, return_sequences=True),
+        Dropout(0.2),
+        LSTM(50, return_sequences=True),
+        Dropout(0.2),
+        LSTM(50),
+        Dropout(0.2),
+        Dense(1),
+    ])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    history = model.fit(x_train, y_train, epochs=epochs, batch_size=batch_size, verbose=0)
+    return model, history
+
+
+if not uploaded_files:
+    st.info("Upload CSV files from the sidebar to get started.")
+    st.stop()
+
+companies = []
+company_names = []
+
+for i, f in enumerate(uploaded_files[:4]):
+    df = load_and_clean(f)
+    if i == 3:
+        df = apply_ema_smoothing(df, BETA)
+    df = add_moving_averages(df)
+    companies.append(df)
+    company_names.append(f.name.replace(".csv", ""))
+
+tabs = st.tabs(["Overview", "EDA", "Moving Averages", "Train & Predict"])
+
+with tabs[0]:
+    st.subheader("Dataset Overview")
+    for name, df in zip(company_names, companies):
+        st.markdown(f"**{name}**")
+        st.dataframe(df.head(5), use_container_width=True)
+        st.caption(f"Shape: {df.shape}")
+
+with tabs[1]:
+    st.subheader("Closing Price — All Companies")
+    n = len(companies)
+    cols = 2
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 4 * rows))
+    axes = np.array(axes).flatten()
+    for i, (name, df) in enumerate(zip(company_names, companies)):
+        axes[i].plot(df["Date"], df["Close"], linewidth=1.2)
+        axes[i].set_title(name)
+        axes[i].set_ylabel("Close")
+        axes[i].tick_params(axis="x", rotation=30)
+    for j in range(i + 1, len(axes)):
+        axes[j].set_visible(False)
+    fig.tight_layout()
     st.pyplot(fig)
-    plt.close(fig)
 
-    st.subheader("Tag Correlation Heatmap")
-    tag_cols = [f"tag_{no}" for no in range(17)]
-    fig2, ax2 = plt.subplots(figsize=(10, 8))
-    sns.heatmap(features[tag_cols].T.corr(), square=True, cmap="jet", ax=ax2)
+    st.subheader("Descriptive Statistics")
+    selected = st.selectbox("Select company", company_names, key="desc")
+    idx = company_names.index(selected)
+    st.dataframe(companies[idx].describe(), use_container_width=True)
+
+with tabs[2]:
+    st.subheader("Moving Averages")
+    selected_ma = st.selectbox("Select company", company_names, key="ma")
+    idx = company_names.index(selected_ma)
+    df = companies[idx]
+    fig2, ax2 = plt.subplots(figsize=(14, 5))
+    ax2.plot(df["Date"], df["Close"], label="Close", linewidth=1)
+    ax2.plot(df["Date"], df["MA_10"], label="MA 10", linewidth=1)
+    ax2.plot(df["Date"], df["MA_20"], label="MA 20", linewidth=1)
+    ax2.plot(df["Date"], df["MA_50"], label="MA 50", linewidth=1)
+    ax2.set_title(f"{selected_ma} — Moving Averages")
+    ax2.legend()
+    ax2.tick_params(axis="x", rotation=30)
+    fig2.tight_layout()
     st.pyplot(fig2)
-    plt.close(fig2)
 
+with tabs[3]:
+    st.subheader("Train LSTM & Predict")
 
-elif section == "Responders Metadata":
-    st.header("Responders Metadata")
-    rpath = f"{ROOT_DIR}/responders.csv"
-    if not os.path.exists(rpath):
-        st.error(f"File not found: {rpath}")
-        st.stop()
+    selected_train = st.selectbox("Select company to train", company_names, key="train")
+    train_ratio = st.slider("Train split (%)", 60, 90, 80)
+    epochs_input = st.number_input("Epochs", min_value=5, max_value=200, value=EPOCHS, step=5)
 
-    responders = pd.read_csv(rpath)
-    st.dataframe(responders, use_container_width=True)
+    if st.button("Train Model"):
+        idx = company_names.index(selected_train)
+        df = companies[idx]
 
-    st.subheader("Responder Tag Correlation Heatmap")
-    tag_cols = [f"tag_{no}" for no in range(5)]
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(
-        responders[tag_cols].T.corr(),
-        annot=True,
-        square=True,
-        cmap="jet",
-        ax=ax,
-    )
-    ax.set_xlabel("responder_0 ~ responder_8")
-    ax.set_ylabel("responder_0 ~ responder_8")
-    st.pyplot(fig)
-    plt.close(fig)
+        trainset = df[["Open"]].values
+        split = int(len(trainset) * train_ratio / 100)
+        train_data = trainset[:split]
+        test_data = trainset[split:]
 
+        sc = MinMaxScaler(feature_range=(0, 1))
+        train_scaled = sc.fit_transform(train_data)
 
-elif section == "Sample Submission":
-    st.header("Sample Submission")
-    spath = f"{ROOT_DIR}/sample_submission.csv"
-    if not os.path.exists(spath):
-        st.error(f"File not found: {spath}")
-        st.stop()
+        if len(train_scaled) <= LOOKBACK:
+            st.error(f"Not enough training rows. Need more than {LOOKBACK}.")
+            st.stop()
 
-    sub = pd.read_csv(spath)
-    st.write(f"Shape: {sub.shape}")
-    st.dataframe(sub, use_container_width=True)
+        x_train, y_train = build_sequences(train_scaled, LOOKBACK)
 
+        with st.spinner("Training LSTM..."):
+            model, history = train_lstm(x_train, y_train, epochs=int(epochs_input))
 
-elif section == "Missing Values":
-    st.header("Missing Values per Partition")
-    partition_id = st.sidebar.selectbox("Partition ID", PARTITION_OPTIONS)
+        st.success("Training complete.")
 
-    path = f"{ROOT_DIR}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    if not os.path.exists(path):
-        st.error(f"File not found: {path}")
-        st.stop()
+        fig_loss, ax_loss = plt.subplots(figsize=(10, 3))
+        ax_loss.plot(history.history["loss"])
+        ax_loss.set_title("Training Loss")
+        ax_loss.set_xlabel("Epoch")
+        ax_loss.set_ylabel("MSE")
+        fig_loss.tight_layout()
+        st.pyplot(fig_loss)
 
-    with st.spinner("Loading parquet..."):
-        train = pl.read_parquet(path)
+        dataset_total = df["Open"].values
+        inputs = dataset_total[len(dataset_total) - len(test_data) - LOOKBACK:]
+        inputs = inputs.reshape(-1, 1)
+        inputs = sc.transform(inputs)
 
-    supervised = train.filter(pl.col("responder_6").is_not_null())
-    missing_count = (
-        supervised.null_count()
-        .transpose(include_header=True, header_name="feature", column_names=["null_count"])
-        .sort("null_count", descending=True)
-        .with_columns((pl.col("null_count") / len(supervised)).alias("null_ratio"))
-    )
+        x_test = []
+        for i in range(LOOKBACK, len(inputs)):
+            x_test.append(inputs[i - LOOKBACK:i, 0])
+        x_test = np.array(x_test).reshape(-1, LOOKBACK, 1)
 
-    mc = missing_count.to_pandas()
-    st.write(f"Samples with target: {len(supervised):,}")
-    st.dataframe(mc, use_container_width=True)
+        predicted = model.predict(x_test)
+        predicted = sc.inverse_transform(predicted)
 
-    fig, ax = plt.subplots(figsize=(8, 22))
-    y = np.arange(len(mc))
-    ax.barh(y, mc["null_ratio"], color="coral", label="missing")
-    ax.barh(y, 1 - mc["null_ratio"], left=mc["null_ratio"], color="darkseagreen", label="available")
-    ax.set_yticks(y)
-    ax.set_yticklabels(mc["feature"], fontsize=7)
-    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-    ax.set_xlim(0, 1)
-    ax.legend()
-    ax.set_title(f"Missing values — partition {partition_id}")
-    st.pyplot(fig)
-    plt.close(fig)
+        real = test_data
+        n_pred = min(len(real), len(predicted))
 
+        rmse = math.sqrt(mean_squared_error(real[:n_pred], predicted[:n_pred]))
+        mae = mean_absolute_error(real[:n_pred], predicted[:n_pred])
+        col1, col2 = st.columns(2)
+        col1.metric("RMSE", f"{rmse:.4f}")
+        col2.metric("MAE", f"{mae:.4f}")
 
-elif section == "Feature Correlations":
-    st.header("Feature Correlation Heatmap (79 features)")
-    partition_id = st.sidebar.selectbox("Partition ID", PARTITION_OPTIONS)
+        test_dates = df["Date"].values[split:split + n_pred]
+        fig_pred, ax_pred = plt.subplots(figsize=(14, 5))
+        ax_pred.plot(df["Date"].values[:split], df["Open"].values[:split], label="Train", linewidth=0.8)
+        ax_pred.plot(test_dates, real[:n_pred], label="Actual", linewidth=1.2)
+        ax_pred.plot(test_dates, predicted[:n_pred], label="Predicted", linewidth=1.2, linestyle="--")
+        ax_pred.set_title(f"{selected_train} — Actual vs Predicted (Open Price)")
+        ax_pred.legend()
+        ax_pred.tick_params(axis="x", rotation=30)
+        fig_pred.tight_layout()
+        st.pyplot(fig_pred)
 
-    path = f"{ROOT_DIR}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    if not os.path.exists(path):
-        st.error(f"File not found: {path}")
-        st.stop()
+        result_df = pd.DataFrame({
+            "Date": test_dates,
+            "Actual": real[:n_pred].flatten(),
+            "Predicted": predicted[:n_pred].flatten(),
+        })
+        st.dataframe(result_df, use_container_width=True)
 
-    with st.spinner("Loading parquet..."):
-        train = pl.read_parquet(path)
-
-    feat_cols = [f"feature_{i:02d}" for i in range(79)]
-    corr = train[feat_cols].to_pandas().corr()
-
-    fig, ax = plt.subplots(figsize=(18, 16))
-    sns.heatmap(corr, square=True, cmap="jet", ax=ax, xticklabels=4, yticklabels=4)
-    ax.set_xlabel("feature_00 ~ feature_78")
-    ax.set_ylabel("feature_00 ~ feature_78")
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-elif section == "Responder Distributions":
-    st.header("Responder Distributions")
-    partition_id = st.sidebar.selectbox("Partition ID", PARTITION_OPTIONS)
-
-    path = f"{ROOT_DIR}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    if not os.path.exists(path):
-        st.error(f"File not found: {path}")
-        st.stop()
-
-    with st.spinner("Loading parquet..."):
-        train = pl.read_parquet(path)
-
-    selected = st.multiselect(
-        "Select responders", [f"responder_{i}" for i in range(9)], default=["responder_6"]
-    )
-
-    for col in selected:
-        series = train[col].drop_nulls()
-        mean_ = series.mean()
-        sgm_ = np.sqrt(series.var())
-        min_ = series.min()
-        max_ = series.max()
-
-        st.subheader(col)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Mean", f"{mean_:.4f}")
-        c2.metric("Std", f"{sgm_:.4f}")
-        c3.metric("Min", f"{min_:.4f}")
-        c4.metric("Max", f"{max_:.4f}")
-
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.hist(series.to_numpy(), bins=40, color="steelblue", edgecolor="white")
-        ax.set_xlabel(col)
-        ax.set_ylabel("frequency")
-        ax.grid(True)
-        st.pyplot(fig)
-        plt.close(fig)
-
-
-elif section == "Responder Correlations":
-    st.header("Responder Correlation Heatmap")
-    partition_id = st.sidebar.selectbox("Partition ID", PARTITION_OPTIONS)
-
-    path = f"{ROOT_DIR}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    if not os.path.exists(path):
-        st.error(f"File not found: {path}")
-        st.stop()
-
-    with st.spinner("Loading parquet..."):
-        train = pl.read_parquet(path)
-
-    resp_cols = [f"responder_{i}" for i in range(9)]
-    corr = train[resp_cols].to_pandas().corr()
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-    sns.heatmap(corr, annot=True, square=True, cmap="jet", ax=ax, fmt=".2f")
-    ax.set_xlabel("responder_0 ~ responder_8")
-    ax.set_ylabel("responder_0 ~ responder_8")
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-elif section == "Symbol ID Distribution":
-    st.header("Symbol ID Distribution")
-    partition_id = st.sidebar.selectbox("Partition ID", PARTITION_OPTIONS)
-
-    path = f"{ROOT_DIR}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    if not os.path.exists(path):
-        st.error(f"File not found: {path}")
-        st.stop()
-
-    with st.spinner("Loading parquet..."):
-        train = pl.read_parquet(path)
-
-    sid = train["symbol_id"]
-    st.write(f"symbol_id range: {sid.min()} – {sid.max()}")
-
-    bins = int(sid.max() - sid.min() + 1)
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.hist(sid.to_numpy(), bins=min(bins, 200), color="mediumpurple", edgecolor="white")
-    ax.set_xlabel("symbol_id")
-    ax.set_ylabel("frequency")
-    ax.grid(True)
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-elif section == "Date ID Distribution":
-    st.header("Date ID Distribution")
-    partition_id = st.sidebar.selectbox("Partition ID", PARTITION_OPTIONS)
-
-    path = f"{ROOT_DIR}/train.parquet/partition_id={partition_id}/part-0.parquet"
-    if not os.path.exists(path):
-        st.error(f"File not found: {path}")
-        st.stop()
-
-    with st.spinner("Loading parquet..."):
-        train = pl.read_parquet(path)
-
-    did = train["date_id"]
-    st.write(f"date_id range: {did.min()} – {did.max()}")
-
-    bins = int(did.max() - did.min() + 1)
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.hist(did.to_numpy(), bins=min(bins, 300), color="teal", edgecolor="white")
-    ax.set_xlabel("date_id")
-    ax.set_ylabel("frequency")
-    ax.grid(True)
-    st.pyplot(fig)
-    plt.close(fig)
+        csv = result_df.to_csv(index=False).encode()
+        st.download_button("Download Predictions CSV", csv, "predictions.csv", "text/csv")
